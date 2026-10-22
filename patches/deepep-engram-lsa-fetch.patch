@@ -1,0 +1,282 @@
+diff --git a/csrc/buffers/engram.hpp b/csrc/buffers/engram.hpp
+index 6309602..5970bb5 100644
+--- a/csrc/buffers/engram.hpp
++++ b/csrc/buffers/engram.hpp
+@@ -201,6 +201,36 @@ public:
+ 
+         EP_HOST_ASSERT(context->num_ranks % context->gin_min_stride == 0);
+         const auto num_rdma_peers = context->num_ranks / context->gin_min_stride;
++
++        // With a single RDMA peer every shard is reachable through the NVLink
++        // mapping, so GIN is not needed at all. That is the only way to fetch on
++        // hosts without an IB device.
++        const auto use_lsa = num_rdma_peers == 1 and context->rdma_storage_base_ptr != nullptr;
++        if (use_lsa) {
++            launch_engram_fetch_lsa(
++                context->dev_comm, context->window,
++                context->rdma_storage_base_ptr, context->num_rdma_storage_bytes,
++                context->buffer, indices.data_ptr<int>(),
++                sf_shards_ptr, fetched_sf_ptr,
++                sf_token_stride, sf_hidden_stride, sf_layer_stride,
++                context->num_nvl_ranks,
++                num_entries_per_layer,
++                hidden, elem_size, num_sf_packs,
++                num_entries_per_token,
++                num_tokens, num_max_tokens,
++                context->num_nvl_ranks,
++                at::cuda::getCurrentCUDAStream()
++            );
++
++            std::vector<std::function<pybind11::object()>> lsa_hooks;
++            for (int i = 0; i < num_layers; ++ i) {
++                lsa_hooks.emplace_back([=]() -> pybind11::object {
++                    return use_fp8 ? pybind11::make_tuple(fetched[i], fetched_sf[i]) : pybind11::cast(fetched[i]);
++                });
++            }
++            return lsa_hooks;
++        }
++
+         EP_HOST_ASSERT(num_rdma_peers * num_qps <= layout::EngramWorkspace::kNumMaxPeerContexts);
+         const auto num_active_gin_contexts =
+             std::min(num_qps, math::ceil_div(num_tokens, 32));
+diff --git a/csrc/kernels/comm/api.hpp b/csrc/kernels/comm/api.hpp
+index 8600109..3c5f98d 100644
+--- a/csrc/kernels/comm/api.hpp
++++ b/csrc/kernels/comm/api.hpp
+@@ -59,6 +59,9 @@ public:
+     void* buffer;
+     void* buffer_multimem = nullptr;
+     void* local_rdma_storage_ptr = nullptr;
++    // Base of the intra-node storage segments. Segment i (0 <= i < num_nvl_ranks)
++    // starts at rdma_storage_base_ptr + i * num_rdma_storage_bytes.
++    void* rdma_storage_base_ptr = nullptr;
+     std::vector<ncclWindow_t> rdma_storage_windows;
+     ncclWindow_t* rdma_storage_windows_gpu = nullptr;
+ 
+diff --git a/csrc/kernels/comm/context.cpp b/csrc/kernels/comm/context.cpp
+index d26fdac..688f658 100644
+--- a/csrc/kernels/comm/context.cpp
++++ b/csrc/kernels/comm/context.cpp
+@@ -171,6 +171,12 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
+     EP_HOST_ASSERT(num_ranks % num_nvl_ranks == 0 and nvl_rank_idx == rank_idx % num_nvl_ranks);
+     EP_HOST_ASSERT(rank_idx == rdma_rank_idx * num_nvl_ranks + nvl_rank_idx);
+ 
++    // Without GIN there is no RDMA stride to honor. Keep one peer group per node
++    // so that the storage windows still cover every intra-node rank and the LSA
++    // fetch path observes num_rdma_peers == 1.
++    if (get_env("EP_DISABLE_GIN", 0) != 0)
++        gin_min_stride = num_nvl_ranks;
++
+     // Calculate scaleout/up domain size
+     if (allow_hybrid_mode) {
+         num_scaleout_ranks = num_rdma_ranks, num_scaleup_ranks = num_nvl_ranks;
+@@ -206,6 +212,7 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
+ 
+     if (num_rdma_storage_bytes > 0) {
+         auto* storage_base_ptr = math::advance_ptr(symmetric_memory->ptr, symmetric_memory->num_sym_bytes);
++        rdma_storage_base_ptr = storage_base_ptr;
+         local_rdma_storage_ptr = math::advance_ptr(storage_base_ptr, (rank_idx % gin_min_stride) * num_rdma_storage_bytes);
+ 
+         rdma_storage_windows.resize(gin_min_stride, nullptr);
+diff --git a/csrc/kernels/engram/engram.hpp b/csrc/kernels/engram/engram.hpp
+index d0d6994..1099a26 100644
+--- a/csrc/kernels/engram/engram.hpp
++++ b/csrc/kernels/engram/engram.hpp
+@@ -87,6 +87,65 @@ static void __instantiate_kernel() {{
+     );
+ }
+ 
++// Fetch path that needs no RDMA: it reads the intra-node storage segments that
++// `HybridElasticSymmetricMemory` mapped into this process. See
++// `engram_fetch_lsa.cuh` for the constraints (single RDMA peer).
++static void launch_engram_fetch_lsa(const deep_jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
++                                    const void* storage_base, const int64_t& num_rdma_storage_bytes,
++                                    void* fetched, int* indices,
++                                    void* sf_shards, void* fetched_sf,
++                                    const int& sf_token_stride, const int& sf_hidden_stride,
++                                    const int& sf_layer_stride,
++                                    const int& num_sf_shards,
++                                    const std::vector<int>& num_entries_per_layer,
++                                    const int& hidden, const int& elem_size, const int& num_sf_packs,
++                                    const int& num_entries_per_token,
++                                    const int& num_tokens, const int& num_max_tokens,
++                                    const int& num_ranks_per_rdma_peer,
++                                    const at::cuda::CUDAStream& stream) {
++    constexpr int kNumThreads = 512;
++    const auto num_sms = jit->device.get_num_sms();
++
++    std::string num_entries_per_layer_string;
++    num_entries_per_layer_string.reserve(num_entries_per_layer.size() * 12);
++    for (const auto num_entries : num_entries_per_layer) {
++        if (not num_entries_per_layer_string.empty())
++            num_entries_per_layer_string += ", ";
++        num_entries_per_layer_string += std::to_string(num_entries);
++    }
++    const auto func_name = std::format(
++        "engram_fetch_lsa_impl<{}, {}, deep_ep::layout::EngramLayout<{}, {}, {}, {}, {}>, {}, {}>",
++        kNumThreads, num_max_tokens,
++        num_ranks_per_rdma_peer, num_sf_shards,
++        hidden * elem_size, num_entries_per_token,
++        num_entries_per_layer_string,
++        num_sf_packs, num_ranks_per_rdma_peer);
++
++    // Compile
++    const auto kernel = jit->compile("engram_fetch_lsa", std::format(R"(
++#include <deep_ep/impls/engram/engram_fetch_lsa.cuh>
++
++static void __instantiate_kernel() {{
++    auto ptr = reinterpret_cast<void*>(&deep_ep::engram::{});
++}}
++)", func_name));
++
++    // Launch
++    jit->launch(
++        kernel, {
++            .stream = stream.stream(),
++            .grid_dim = dim3(num_sms, 1, 1),
++            .block_dim = dim3(kNumThreads, 1, 1),
++        },
++        nccl_dev_comm, nccl_window,
++        static_cast<const uint8_t*>(storage_base), num_rdma_storage_bytes,
++        fetched, indices,
++        static_cast<const sf_pack_t*>(sf_shards), static_cast<sf_pack_t*>(fetched_sf),
++        sf_token_stride, sf_hidden_stride, sf_layer_stride,
++        num_tokens
++    );
++}
++
+ static void launch_engram_fetch_wait(ncclGinRequest_t* last_gin_requests,
+                                      const deep_jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
+                                      const int& num_rdma_peers,
+diff --git a/deep_ep/include/deep_ep/impls/engram/engram_fetch_lsa.cuh b/deep_ep/include/deep_ep/impls/engram/engram_fetch_lsa.cuh
+new file mode 100644
+index 0000000..25c8638
+--- /dev/null
++++ b/deep_ep/include/deep_ep/impls/engram/engram_fetch_lsa.cuh
+@@ -0,0 +1,126 @@
++#pragma once
++
++#include <cstdint>
++
++#include <nccl.h>
++#include <nccl_device.h>
++
++#include <deep_ep/common/compiled.cuh>
++#include <deep_ep/common/math.cuh>
++#include <deep_ep/layout/engram/workspace.cuh>
++
++
++namespace deep_ep::engram {
++
++// Fetch path for hosts where every Engram peer lives in the same NVLink domain.
++//
++// The RDMA path issues one GIN read per entry, which needs an IB device. Here we
++// instead walk the storage segments that `HybridElasticSymmetricMemory` already
++// mapped into this process and copy with plain loads: each intra-node rank's
++// segment sits at `storage_base + i * num_rdma_storage_bytes`, and the mapping is
++// granted device access, so the copy works for both CPU and GPU storage.
++//
++// The caller must guarantee `kNumRDMAPeers == 1`. Entries that would belong to a
++// cross-node peer are skipped rather than served from the wrong segment.
++template <int kNumThreads, int kNumMaxTokens,
++          typename engram_layout_t,
++          int kNumSFPacks, int kNumRanksPerRDMAPeer>
++__global__ void __launch_bounds__(kNumThreads, 1)
++engram_fetch_lsa_impl(
++    const ncclDevComm_t nccl_dev_comm,
++    const ncclWindow_t nccl_window,
++    const uint8_t* storage_base,
++    const int64_t num_rdma_storage_bytes,
++    void* fetched,
++    const int* indices,
++    const sf_pack_t* sf_shards,
++    sf_pack_t* fetched_sf,
++    const int sf_token_stride,
++    const int sf_hidden_stride,
++    const int sf_layer_stride,
++    const int num_tokens
++) {
++    constexpr int kNumLayers = engram_layout_t::kNumLayers;
++    constexpr int kNumEntriesPerToken = engram_layout_t::kNumEntriesPerToken;
++    constexpr int kNumHiddenBytes = engram_layout_t::kNumHiddenBytes;
++    constexpr int kVecBytes = 16;
++    EP_STATIC_ASSERT(kNumHiddenBytes % kVecBytes == 0, "Engram hidden bytes must be 16-byte aligned");
++
++    const auto tid = static_cast<int64_t>(blockIdx.x) * kNumThreads + threadIdx.x;
++    const auto num_threads = static_cast<int64_t>(gridDim.x) * kNumThreads;
++    const auto num_entries = static_cast<int64_t>(num_tokens) * kNumEntriesPerToken;
++
++    // Weight vectors: each entry is one contiguous run of `kNumHiddenBytes`.
++    #pragma unroll
++    for (int layer_idx = 0; layer_idx < kNumLayers; ++ layer_idx) {
++        const auto num_entries_per_rank = engram_layout_t::get_num_entries(layer_idx);
++        const auto* layer_indices = indices + static_cast<int64_t>(layer_idx) * num_entries;
++        for (int64_t entry_idx = tid; entry_idx < num_entries; entry_idx += num_threads) {
++            const auto global_idx = __ldg(layer_indices + entry_idx);
++            if (global_idx < 0)
++                continue;
++
++            const auto rank_in_node = global_idx / num_entries_per_rank;
++            if (rank_in_node >= kNumRanksPerRDMAPeer)
++                continue;
++
++            const auto local_entry_idx = global_idx % num_entries_per_rank;
++            const auto* src = storage_base +
++                static_cast<int64_t>(rank_in_node) * num_rdma_storage_bytes +
++                engram_layout_t::get_storage_byte_offset(layer_idx, local_entry_idx);
++            auto* dst = static_cast<uint8_t*>(fetched) +
++                engram_layout_t::get_recv_byte_offset(layer_idx, entry_idx, kNumMaxTokens);
++
++            const auto* src_vec = reinterpret_cast<const uint4*>(src);
++            auto* dst_vec = reinterpret_cast<uint4*>(dst);
++            for (int i = 0; i < kNumHiddenBytes / kVecBytes; ++ i)
++                dst_vec[i] = src_vec[i];
++        }
++    }
++
++    // Scale factors already live in one shared buffer, so only the NVLink address
++    // translation is needed -- no GIN context involved.
++    if constexpr (kNumSFPacks > 0) {
++        constexpr int kPacksPerVec = sizeof(uint64_t) / sizeof(sf_pack_t);
++        constexpr int kNumVecs = kNumSFPacks / kPacksPerVec;
++        EP_STATIC_ASSERT(kNumSFPacks % kPacksPerVec == 0, "Invalid number of SF packs");
++
++        const auto lsa_rank = ncclTeamLsa(nccl_dev_comm).rank;
++        const auto lsa_base = reinterpret_cast<uint64_t>(ncclGetLsaPointer(nccl_window, 0, lsa_rank));
++        const auto sf_offset = reinterpret_cast<uint64_t>(sf_shards) - lsa_base;
++
++        #pragma unroll
++        for (int layer_idx = 0; layer_idx < kNumLayers; ++ layer_idx) {
++            const auto* layer_indices = indices + static_cast<int64_t>(layer_idx) * num_entries;
++            for (int64_t entry_idx = tid; entry_idx < num_entries; entry_idx += num_threads) {
++                const auto global_idx = __ldg(layer_indices + entry_idx);
++                if (global_idx < 0)
++                    continue;
++
++                const auto shard_idx = engram_layout_t::get_sf_shard_idx(layer_idx, global_idx);
++                const auto* shard = static_cast<const sf_pack_t*>(
++                    ncclGetLsaPointer(nccl_window, sf_offset, shard_idx));
++                const auto* src = reinterpret_cast<const uint64_t*>(
++                    shard + engram_layout_t::get_sf_row_idx(layer_idx, global_idx) * kNumSFPacks);
++
++                uint64_t values[kNumVecs];
++                #pragma unroll
++                for (int i = 0; i < kNumVecs; ++ i)
++                    values[i] = __ldg(src + i);
++
++                auto* dst = fetched_sf + layer_idx * sf_layer_stride +
++                    (entry_idx / kNumEntriesPerToken) * sf_token_stride +
++                    (entry_idx % kNumEntriesPerToken) * kNumSFPacks * sf_hidden_stride;
++                #pragma unroll
++                for (int i = 0; i < kNumVecs; ++ i) {
++                    #pragma unroll
++                    for (int j = 0; j < kPacksPerVec; ++ j)
++                        dst[(i * kPacksPerVec + j) * sf_hidden_stride] =
++                            reinterpret_cast<const sf_pack_t*>(&values[i])[j];
++                }
++            }
++        }
++    }
++}
++
++}  // namespace deep_ep::engram
