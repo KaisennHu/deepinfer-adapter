@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+
+# Generated gRPC bindings for the vLLM worker protocol; regenerate with
+# scripts/gen_proto.sh
+/deepinfer_adapter/proto_gen/

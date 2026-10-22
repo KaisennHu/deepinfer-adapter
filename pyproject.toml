@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepinfer-adapter"
+version = "0.1.0"
+description = "Serve a DeepInfer engine as a vLLM-style gRPC worker"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "grpcio >= 1.60",
+    "grpcio-health-checking >= 1.60",
+    "protobuf >= 5",
+]
+
+[project.optional-dependencies]
+dev = ["grpcio-tools >= 1.60"]
+
+[tool.setuptools.packages.find]
+include = ["deepinfer_adapter*"]
