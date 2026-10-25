@@ -1,3 +1,5 @@
 # Keep checkouts byte-identical across platforms: the patch files and shell
 # scripts must use LF even when the working copy is on Windows.
 * text=auto eol=lf
+# Unified diff context lines require their leading space, including empty lines.
+*.patch -whitespace

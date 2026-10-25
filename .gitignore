@@ -2,6 +2,10 @@ __pycache__/
 *.py[cod]
 .venv*/
 venv/
+*.egg-info/
+/build/
+/dist/
+/run/
 
 # Generated gRPC bindings for the vLLM worker protocol; regenerate with
 # scripts/gen_proto.sh

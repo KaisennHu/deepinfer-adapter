@@ -282,9 +282,29 @@ def build_server(
     return server, port
 
 
+def _allow_peer_fd_import() -> None:
+    """Let engine ranks import each other's CUDA shareable handles.
+
+    DeepEP's hybrid symmetric memory resolves peer ranks with ``pidfd_getfd``,
+    which the yama LSM rejects for sibling processes when ``ptrace_scope >= 1``.
+    Ranks are siblings here (one process per DP rank) and the scope cannot be
+    relaxed without root, so each rank opts in with ``PR_SET_PTRACER_ANY``.
+    """
+    try:
+        import ctypes
+
+        pr_set_ptracer = 0x59616D61
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+        prctl(pr_set_ptracer, ctypes.c_ulong(-1), 0, 0, 0)
+    except Exception:
+        logger.debug("prctl(PR_SET_PTRACER) unavailable", exc_info=True)
+
+
 def _serve(args: argparse.Namespace, rank: int) -> None:
     """Serve one engine rank on its own gRPC port."""
+    _allow_peer_fd_import()
     port = args.port + rank
+    address = f"{args.host}:{port}"
     backend = _build_backend(args, rank)
     max_model_len = getattr(backend, "max_model_len", 0) or args.max_model_len or _FALLBACK_MAX_MODEL_LEN
     kv_block_size = getattr(backend, "kv_block_size", 0) or args.kv_block_size or _FALLBACK_KV_BLOCK_SIZE
@@ -294,7 +314,7 @@ def _serve(args: argparse.Namespace, rank: int) -> None:
         args.model,
         max_model_len,
         kv_block_size,
-        f"{args.host}:{port}",
+        address,
         args.max_workers,
     )
 

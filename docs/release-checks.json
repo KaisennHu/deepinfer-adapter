@@ -1,0 +1,27 @@
+{
+  "checked_at": "2026-10-25T03:36:11.706139+00:00",
+  "cpu_tests": {
+    "passed": 47,
+    "failed": 0,
+    "warnings": "One Starlette/AnyIO deprecation warning"
+  },
+  "checks": {
+    "shell_syntax": true,
+    "documentation_links": true,
+    "bash_documentation_syntax": true,
+    "deepinfer_patch_applies_to_clean_pinned_commit": true,
+    "deepinfer_patch_is_idempotent": true,
+    "deepep_patch_applies_to_clean_pinned_commit": true,
+    "deepep_patch_is_idempotent": true,
+    "all_222_engine_python_files_match_validated_snapshot": true,
+    "profile_matches_validated_role_environments_and_numeric_arguments": true,
+    "adapter_serving_sources_unchanged_except_package_version": true,
+    "installed_wheel_pd_and_grpc_imports": true,
+    "http_example_fixture_nonstream_and_sse": true,
+    "readiness_script_fixture": true,
+    "staged_credential_pattern_scan": true,
+    "git_diff_check": true
+  },
+  "gpu_benchmark_rerun_for_packaging": false,
+  "wheel_sha256": "5d002f3e50049d3ca15c8f3d1a1a6455fa2b5d561073ba79f96c5d22d0d31fe0"
+}

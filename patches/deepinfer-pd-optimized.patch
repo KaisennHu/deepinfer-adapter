@@ -1,0 +1,870 @@
+diff --git a/csrc/engine/block_manager.hpp b/csrc/engine/block_manager.hpp
+index 51b92aa..5b7acf9 100644
+--- a/csrc/engine/block_manager.hpp
++++ b/csrc/engine/block_manager.hpp
+@@ -6,9 +6,11 @@
+ #include "sequence.hpp"
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <memory>
++#include <unordered_map>
+ #include <vector>
+ 
+ enum class AllocStatus {
+@@ -17,6 +19,30 @@ enum class AllocStatus {
+     NEVER,
+ };
+ 
++/// 前缀缓存用的块哈希：按块链式累积（hash_i 依赖 hash_{i-1} 与本块 token），
++/// 保证“同一前缀在不同请求里得到同一串哈希”，且不同上下文不会撞成同一前缀。
++/// 只对填满的块计算，尾块（不足 block_size）不参与匹配。
++inline std::vector<uint64_t> compute_block_hashes(const std::vector<int> &token_ids, int block_size) {
++    constexpr uint64_t kSeed = 1469598103934665603ULL;
++    constexpr uint64_t kPrime = 1099511628211ULL;
++    TORCH_CHECK(block_size > 0, "block_size must be positive");
++    const int num_full = static_cast<int>(token_ids.size()) / block_size;
++    std::vector<uint64_t> hashes(static_cast<size_t>(num_full));
++    uint64_t prev = kSeed;
++    for (int b = 0; b < num_full; ++b) {
++        uint64_t h = prev;
++        const int *p = token_ids.data() + static_cast<size_t>(b) * block_size;
++        for (int i = 0; i < block_size; ++i) {
++            h ^= static_cast<uint64_t>(static_cast<uint32_t>(p[i]));
++            h *= kPrime;
++        }
++        hashes[static_cast<size_t>(b)] = h;
++        prev = h;
++    }
++    return hashes;
++}
++
++
+ inline double get_timestamp_ms() {
+     struct timeval tp;
+     gettimeofday(&tp, NULL);
+@@ -34,7 +60,13 @@ struct Blocks { // NOTE: gpu blocks 0 是不用的，所以这里 0 代表空
+         _blocks[_n - 1].next = 0;
+     }
+ 
+-    void reset() { TORCH_CHECK(_size == static_cast<decltype(_size)>(_blocks.size()) - 1, "still some blocks in use when reset"); }
++    void reset() {
++        TORCH_CHECK(_size == static_cast<decltype(_size)>(_blocks.size()) - 1, "still some blocks in use when reset");
++        _index.clear();
++        for (auto &block : _blocks) {
++            block.hash = 0;
++        }
++    }
+ 
+     void _push_back(int i) {
+         TORCH_CHECK(i > 0 && i < static_cast<int>(_blocks.size()));
+@@ -81,7 +113,15 @@ struct Blocks { // NOTE: gpu blocks 0 是不用的，所以这里 0 代表空
+ 
+     int allocate() {
+         int block_id = _pop_front(); // _erase 已校验 ref_count == 0
+-        _blocks[block_id].ref_count += 1;
++        auto &block = _blocks[block_id];
++        if (block.hash != 0) { // 该块即将被复用，撤销前缀索引
++            auto it = _index.find(block.hash);
++            if (it != _index.end() && it->second == block_id) {
++                _index.erase(it);
++            }
++            block.hash = 0;
++        }
++        block.ref_count += 1;
+         return block_id;
+     }
+ 
+@@ -92,18 +132,66 @@ struct Blocks { // NOTE: gpu blocks 0 是不用的，所以这里 0 代表空
+         block.ref_count += 1;
+     }
+ 
+-    void free(int block_id) {
++    /// 归还块。ref_count 归零时若给了 hash 且处于前缀缓存模式，块内容保留在显存里并进入索引，
++    /// 仍留在自由链表上——分配时按链表头部（最久未使用）优先回收，因此天然是 LRU 淘汰。
++    void free(int block_id, uint64_t hash = 0) {
+         TORCH_CHECK(block_id > 0 && block_id < static_cast<int>(_blocks.size()));
+         auto &block = _blocks[block_id];
+         block.ref_count -= 1;
+         TORCH_CHECK(block.ref_count >= 0, "ref_count corrupted: ref_count < 0");
+         if (block.ref_count == 0) {
++            if (_prefix_cache && hash != 0 && _size >= _cache_reserve) {
++                block.hash = hash;
++                auto it = _index.find(hash);
++                if (it == _index.end()) {
++                    _index.emplace(hash, block_id);
++                } else {
++                    // 同一前缀已有更早的副本：旧块失去索引，等自然回收
++                    if (it->second != block_id) {
++                        _blocks[it->second].hash = 0;
++                    }
++                    it->second = block_id;
++                }
++            }
+             _push_back(block_id);
+         }
+     }
+ 
++    /// 按哈希取回一个缓存块：从自由链表摘下、ref_count 置 1，调用方负责后续 free。
++    /// 未命中返回 -1。
++    int take_cached(uint64_t hash) {
++        auto it = _index.find(hash);
++        if (it == _index.end()) {
++            return -1;
++        }
++        int block_id = it->second;
++        _index.erase(it);
++        auto &block = _blocks[block_id];
++        TORCH_CHECK(block.ref_count == 0, "cached block must be free, ref_count=", block.ref_count);
++        _erase(block_id);
++        block.hash = 0;
++        block.ref_count = 1;
++        return block_id;
++    }
++
++    void set_prefix_cache(bool enable, int reserve_blocks) {
++        _prefix_cache = enable;
++        _cache_reserve = std::max(0, reserve_blocks);
++        if (!enable) {
++            _index.clear();
++            for (auto &block : _blocks) {
++                block.hash = 0;
++            }
++        }
++    }
++
++    bool prefix_cache_enabled() const { return _prefix_cache; }
++
++    int num_cached_blocks() const { return static_cast<int>(_index.size()); }
++
+     struct block {
+         int ref_count{0};
++        uint64_t hash{0}; // 非 0 表示该块内容可作为前缀缓存命中
+ 
+         // 链表，维护 free_blocks
+         int next{0};
+@@ -114,6 +202,11 @@ struct Blocks { // NOTE: gpu blocks 0 是不用的，所以这里 0 代表空
+     // free_blocks 链表
+     int _head, _tail;
+     int _size;
++
++private:
++    bool _prefix_cache{false};
++    int _cache_reserve{0};
++    std::unordered_map<uint64_t, int> _index;
+ };
+ 
+ struct BlockManager : public deepinfer::Lockable {
+@@ -148,12 +241,46 @@ struct BlockManager : public deepinfer::Lockable {
+         std::for_each(block_ids.rbegin(), block_ids.rend(), [this](int block_id) { blocks.free(block_id); });
+     }
+ 
++    /// 归还块并把内容登记为前缀缓存。hashes[i] 与 block_ids[i] 对齐，0 表示该块不入缓存
++    /// （例如不足一个 block 的尾块）。
++    void free_blocks_with_hashes_nolock(const std::vector<int> &block_ids, const std::vector<uint64_t> &hashes) {
++        int total = static_cast<int>(block_ids.size());
++        for (int i = total - 1; i >= 0; --i) {
++            uint64_t hash = (i < static_cast<int>(hashes.size())) ? hashes[static_cast<size_t>(i)] : 0;
++            blocks.free(block_ids[i], hash);
++        }
++    }
++
+     void free_blocks(const std::vector<int> &block_ids) {
+         lock();
+         free_blocks_nolock(block_ids);
+         unlock();
+     }
+ 
++    void enable_prefix_cache(bool enable, int reserve_blocks = 0) {
++        lock();
++        blocks.set_prefix_cache(enable, reserve_blocks);
++        unlock();
++    }
++
++    bool prefix_cache_enabled() const { return blocks.prefix_cache_enabled(); }
++
++    int num_cached_blocks() const { return blocks.num_cached_blocks(); }
++
++    /// 按哈希链依次取回缓存块，遇到第一个未命中即停止。返回值即最长可复用前缀块数。
++    std::vector<int> take_cached_blocks_nolock(const std::vector<uint64_t> &hashes) {
++        std::vector<int> adopted;
++        adopted.reserve(hashes.size());
++        for (uint64_t hash : hashes) {
++            int block_id = blocks.take_cached(hash);
++            if (block_id < 0) {
++                break;
++            }
++            adopted.push_back(block_id);
++        }
++        return adopted;
++    }
++
+     void pin_blocks_nolock(const std::vector<int> &block_ids) {
+         for (auto &&block_id : block_ids) {
+             blocks.pin_block(block_id);
+@@ -205,8 +332,13 @@ struct BlockManagerMutexAcquire {
+ 
+     /// 调用者需要自行保证存在充足资源
+     void allocate_seq(Sequence &seq) {
+-        auto &&block_table = this->block_manager->allocate_nolock(seq.get_num_blocks());
+-        seq.cache.block_table = std::move(block_table);
++        // block_table 可能已被前缀缓存预填（命中块），只补齐缺口
++        int existing = static_cast<int>(seq.cache.block_table.size());
++        int to_allocate = seq.get_num_blocks() - existing;
++        TORCH_CHECK(to_allocate >= 0, "block_table larger than num_blocks, existing=", existing,
++                    " required=", seq.get_num_blocks());
++        auto &&block_table = this->block_manager->allocate_nolock(to_allocate);
++        seq.cache.block_table.insert(seq.cache.block_table.end(), block_table.begin(), block_table.end());
+         if (this->state_manager) {
+             auto state_id = this->state_manager->allocate_single_nolock();
+             seq.cache.state_id = state_id;
+diff --git a/csrc/engine/pybind_scheduler.cpp b/csrc/engine/pybind_scheduler.cpp
+index a379e85..9c42346 100644
+--- a/csrc/engine/pybind_scheduler.cpp
++++ b/csrc/engine/pybind_scheduler.cpp
+@@ -70,7 +70,10 @@ void pybind_engine_scheduler(pybind11::module &engine) {
+         .def("unlock", &BlockManager::unlock)
+         .def("reset", &BlockManager::reset, py::call_guard<py::gil_scoped_release>())
+         .def("allocate_nolock", &BlockManager::allocate_nolock, py::arg("num_blocks"))
+-        .def("get_num_free_blocks", &BlockManager::get_num_free_blocks);
++        .def("get_num_free_blocks", &BlockManager::get_num_free_blocks)
++        .def("enable_prefix_cache", &BlockManager::enable_prefix_cache, py::call_guard<py::gil_scoped_release>(),
++            py::arg("enable"), py::arg("reserve_blocks") = 0)
++        .def("num_cached_blocks", &BlockManager::num_cached_blocks);
+ 
+     py::class_<SequenceMetadataPool>(engine, "SequenceMetadataPool")
+         .def(py::init<>())
+@@ -100,6 +103,12 @@ void pybind_engine_scheduler(pybind11::module &engine) {
+         .def(
+             "free_seq", [](Scheduler &self, Sequence &seq) { self.free_seq(seq); }, py::arg("seq"),
+             py::call_guard<py::gil_scoped_release>())
++        .def("pop_prompted_seqs", &Scheduler::pop_prompted_seqs, py::call_guard<py::gil_scoped_release>(),
++            "PD 分离用：取走 prompted 队列里 prefill 完成、KV 待转移的 seq")
++        .def("pop_processed_seqs", &Scheduler::pop_processed_seqs,
++            "PD: 取走 KV 已算完但引擎不会收尾的 seq（PROMPT 引擎）")
++        .def("adopt_running_seq", &Scheduler::adopt_running_seq, py::arg("seq"),
++            "PD: 把外部灌好 KV 的 seq 直接放入 running")
+         .def("get_num_free_gpu_blocks", &Scheduler::get_num_free_gpu_blocks)
+         .def("get_sum_prompt_len_running", &Scheduler::get_sum_prompt_len_running)
+         .def("get_sum_prompt_len_waiting", &Scheduler::get_sum_prompt_len_waiting)
+diff --git a/csrc/engine/pybind_sequence.cpp b/csrc/engine/pybind_sequence.cpp
+index 7d628dc..0898e4f 100644
+--- a/csrc/engine/pybind_sequence.cpp
++++ b/csrc/engine/pybind_sequence.cpp
+@@ -130,6 +130,7 @@ void pybind_engine_sequence(pybind11::module &engine) {
+     bind_sequence_property(sequence, "schedulable", [](Sequence &seq) -> auto & { return seq.schedule.schedulable; });
+     bind_sequence_property(sequence, "state_id", [](Sequence &seq) -> auto & { return seq.cache.state_id; });
+     bind_sequence_property(sequence, "swa_valid_start", [](Sequence &seq) -> auto & { return seq.cache.swa_valid_start; });
++    bind_sequence_property(sequence, "block_table", [](Sequence &seq) -> auto & { return seq.cache.block_table; });
+     bind_sequence_property(
+         sequence, "last_copy_state_token_idx", [](Sequence &seq) -> auto & { return seq.cache.last_copy_state_token_idx; });
+     bind_sequence_readonly(sequence, "chunked_rest_len", [](const Sequence &seq) -> const auto & { return seq.schedule.chunked_rest_len; });
+diff --git a/csrc/engine/scheduler.hpp b/csrc/engine/scheduler.hpp
+index ed6e897..97231fa 100644
+--- a/csrc/engine/scheduler.hpp
++++ b/csrc/engine/scheduler.hpp
+@@ -166,6 +166,52 @@ struct Scheduler {
+ 
+     int get_num_unfinished_seqs() { return waiting.size() + running.size() + prompted.size(); }
+ 
++    /// PD 分离用：取走 prompted 队列里所有“prefill 已完成、KV 待转移”的 seq。
++    /// PROMPT 引擎不会把 prompted 转入 running，因此这里取到的一定是尚未开始 decode 的。
++    std::vector<SequencePtr> pop_prompted_seqs() {
++        std::vector<SequencePtr> result;
++        result.reserve(prompted.size());
++        while (!prompted.empty()) {
++            result.push_back(std::move(std::get<0>(prompted.front())));
++            prompted.pop_front();
++        }
++        return result;
++    }
++
++    /// PD 导出用：取走所有“KV 已算完、但引擎不会自行收尾”的 seq。
++    /// PROMPT 引擎既不会把 seq 转入 decode，也不会 finalize，需要调用方接管并负责释放。
++    std::vector<SequencePtr> pop_processed_seqs() {
++        py::gil_scoped_release release;
++        BlockManagerMutexAcquire acquire{block_manager, state_manager};
++        std::vector<SequencePtr> result;
++        result.reserve(running.size() + prompted.size());
++        for (auto it = running.begin(); it != running.end();) {
++            if ((*it)->cache.num_tokens > 0) {
++                result.push_back(std::move(*it));
++                it = running.erase(it);
++            } else {
++                ++it;
++            }
++        }
++        while (!prompted.empty()) {
++            result.push_back(std::move(std::get<0>(prompted.front())));
++            prompted.pop_front();
++        }
++        return result;
++    }
++
++    /// PD 接管用：把外部灌好 KV 的 seq 直接放进 running，跳过 prefill。
++    /// COMPLETION 引擎只跑 `_schedule_decode`，不会把 waiting 里的 seq 转成 prompted，
++    /// 所以 D 侧必须走这个入口。
++    void adopt_running_seq(const SequencePtr &seq) {
++        py::gil_scoped_release release;
++        BlockManagerMutexAcquire acquire{block_manager, state_manager};
++        TORCH_CHECK(seq->schedule.status == SequenceStatus::WAITING, "adopt expects WAITING, got ", int(seq->schedule.status));
++        seq->schedule.status = SequenceStatus::RUNNING;
++        allocate_mtp_info_slot(*seq);
++        running.push_back(seq);
++    }
++
+     /// dp 内做一次 allreduce 并返回归约结果（dp_size==1 时也会走通信，调用方自行短路）。
+     template <typename T> T _dp_allreduce(T value, c10d::ReduceOp op) {
+         auto dtype = std::is_same_v<T, double> ? torch::kFloat32 : torch::kInt32;
+@@ -354,6 +400,7 @@ struct Scheduler {
+         std::vector<int> seqlens_q;
+         int num_curr_seqs = running.size();
+         int num_batched_tokens = 0;
++        int num_cached_tokens_gpu = 0; // 本轮由前缀缓存直接复用的 token 数（仅用于统计）
+ 
+         int prefill_sum_seqlen_k_remain = prefill_max_sum_seqlen_k;
+ 
+@@ -383,7 +430,29 @@ struct Scheduler {
+                     waiting.pop_front();
+                     continue;
+                 }
+-                auto can_allocate = _can_allocate_with_state(seq->get_num_blocks());
++                // === 前缀缓存：按块哈希链取回可复用前缀 ===
++                if (block_manager->prefix_cache_enabled()) {
++                    auto block_hashes = compute_block_hashes(seq->get_token_ids(), seq->cache.block_size);
++                    auto adopted = block_manager->take_cached_blocks_nolock(block_hashes);
++                    if (!adopted.empty()) {
++                        int hit_tokens = static_cast<int>(adopted.size()) * seq->cache.block_size;
++                        // state（SWA 环）无法继承，回退一个窗口重算即可填满；sliding_window == block_size
++                        int usable_tokens = state_manager ? hit_tokens - seq->cache.block_size : hit_tokens;
++                        if (usable_tokens > 0) {
++                            seq->cache.block_table = std::move(adopted);
++                            seq->cache.hit_tokens = hit_tokens;
++                            seq->cache.set_num_tokens(usable_tokens);
++                            seq->cache.swa_valid_start = usable_tokens;
++                            num_cached_tokens_gpu += hit_tokens;
++                            num_prompt_tokens = seq->get_len() - seq->cache.num_tokens;
++                        } else {
++                            // 命中不足一个窗口，还回去等自然回收
++                            block_manager->free_blocks_with_hashes_nolock(adopted, block_hashes);
++                        }
++                    }
++                }
++                auto can_allocate =
++                    _can_allocate_with_state(seq->get_num_blocks() - static_cast<int>(seq->cache.block_table.size()));
+                 if (can_allocate == AllocStatus::LATER) {
+                     break;
+                 } else if (can_allocate == AllocStatus::NEVER) {
+@@ -546,7 +615,8 @@ struct Scheduler {
+         }
+ 
+         if (engine_type != EngineType::NORMAL || !scheduled.empty() || !ignored_seqs.empty()) {
+-            return _make_outputs(std::move(scheduled), true, num_batched_tokens, {}, std::move(ignored_seqs), std::move(seqlens_q), 0);
++            return _make_outputs(std::move(scheduled), true, num_batched_tokens, {}, std::move(ignored_seqs),
++                std::move(seqlens_q), num_cached_tokens_gpu);
+         }
+ 
+         // NORMAL 引擎且本轮没有调度到任何 prompt，交由 _schedule 决定是否转为 decode
+@@ -740,7 +810,13 @@ struct Scheduler {
+         if (seq.cache.state_id != -1) {
+             state_manager->free_blocks_nolock({seq.cache.state_id});
+         }
+-        block_manager->free_blocks_nolock(seq.cache.block_table);
++        if (block_manager->prefix_cache_enabled() && !seq.cache.block_table.empty()) {
++            // 整块的 KV 内容对“同一 token 前缀”始终有效，归还时带上链式哈希进入缓存
++            auto block_hashes = compute_block_hashes(seq.get_token_ids(), seq.cache.block_size);
++            block_manager->free_blocks_with_hashes_nolock(seq.cache.block_table, block_hashes);
++        } else {
++            block_manager->free_blocks_nolock(seq.cache.block_table);
++        }
+         seq.cache.block_table.clear();
+     }
+ 
+diff --git a/deep_cluster/topology/bind.py b/deep_cluster/topology/bind.py
+index 7d180fd..2ac62de 100644
+--- a/deep_cluster/topology/bind.py
++++ b/deep_cluster/topology/bind.py
+@@ -77,6 +77,11 @@ def _perror(message: str) -> None:
+ 
+ 
+ def bind_numa(node: int) -> int:
++    # 设备没有 NUMA 归属时（单节点主机常见返回 -1），不做绑定；
++    # libnuma 的 numa_node_to_cpus 对负 node 会越界写 bitmask，直接段错误。
++    if node < 0:
++        return 0
++    import sys as _s; print(f'[NUMADBG] bind_numa node={node!r}', file=_s.stderr, flush=True)
+     library = _libnuma()
+     cpumask = library.numa_allocate_cpumask()
+     if library.numa_node_to_cpus(node, cpumask):
+diff --git a/deepinfer/engine/llm_engine.py b/deepinfer/engine/llm_engine.py
+index cb87941..5334c8c 100644
+--- a/deepinfer/engine/llm_engine.py
++++ b/deepinfer/engine/llm_engine.py
+@@ -263,6 +263,12 @@ class LLMEngine:
+             f"init block_manager, {(cache_config.num_gpu_blocks, cache_config.bytes_per_block, cache_config.num_state_seqs, cache_config.bytes_of_state_per_seqs)=}"
+         )
+         self.block_manager = BlockManager(cache_config.num_gpu_blocks)
++        if envs.DEEPINFER_PREFIX_CACHE:
++            self.block_manager.enable_prefix_cache(True, envs.DEEPINFER_PREFIX_CACHE_RESERVE_BLOCKS)
++            logger.info(
++                f"prefix cache enabled: reserve_blocks={envs.DEEPINFER_PREFIX_CACHE_RESERVE_BLOCKS}, "
++                f"num_gpu_blocks={cache_config.num_gpu_blocks}"
++            )
+         self.state_manager = BlockManager(cache_config.num_state_seqs) if cache_config.bytes_of_state_per_seqs > 0 else None
+         self.scheduler = self._create_scheduler()
+         self.scheduler.decode_perf_curve = self.driver_worker.decode_perf_curve
+diff --git a/deepinfer/environ.py b/deepinfer/environ.py
+index 332064a..135f535 100644
+--- a/deepinfer/environ.py
++++ b/deepinfer/environ.py
+@@ -103,6 +103,13 @@ class envs:
+     # -- Runtime --
+     DEEPINFER_COMPUTE_SUM_SMALLER_PROBS = EnvVar.bool()
+     DEEPINFER_JIT_CACHE_DIR = EnvVar.str_or_none()
++    DEEPINFER_FUSE_SINGLETON_METADATA = EnvVar.bool()
++    DEEPINFER_PARALLEL_GREEDY_MAX = EnvVar.bool()
++    DEEPINFER_FUSE_GREEDY_REDUCTION = EnvVar.bool()
++    "Fuse CUDA greedy metadata operations; argmax and invalid-logit check remain unchanged."
++
++    DEEPINFER_DISABLE_RUNTIME_TIMERS = EnvVar.bool()
++    "Skip optional CPU/CUDA timing; preserve forward/sample events needed by MTP varlen. Startup-only."
+ 
+     # -- Distributed Communication --
+     DEEPINFER_NCCL_NUM_SMS = EnvVar.int(default=32)
+@@ -193,6 +200,13 @@ class envs:
+     SWA 可见域均为原始滑窗和末尾 KEEP_TOKENS 矩形的交集。必须满足 KEEP_TOKENS >=
+     window_size + DEEPINFER_MAX_BACKTRACKING_TOKENS；默认 0，启用截断时必须显式设置。"""
+ 
++    # -- Prefix Cache --
++    DEEPINFER_PREFIX_CACHE = EnvVar.bool()
++    """开启块级前缀缓存：请求结束时把整块 KV 连同链式哈希留在显存里，
++    下一个同前缀请求直接复用，只 prefill 后缀。默认关闭。"""
++    DEEPINFER_PREFIX_CACHE_RESERVE_BLOCKS = EnvVar.int(default=0)
++    """保留不进入前缀缓存的空闲块数，用于吸收在途请求的分配波峰。"""
++
+     # -- Profiling & Debug --
+     DEEPINFER_BATCH_INVARIANT = EnvVar.bool()
+     DEEPINFER_DISABLE_SYNC_GUARD = EnvVar.bool()
+diff --git a/deepinfer/model_executor/layers/greedy_argmax.py b/deepinfer/model_executor/layers/greedy_argmax.py
+new file mode 100644
+index 0000000..46cec1a
+--- /dev/null
++++ b/deepinfer/model_executor/layers/greedy_argmax.py
+@@ -0,0 +1,57 @@
++"""Full-vocabulary max with parallel tiles for small greedy batches."""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _maximum_with_nan(a, b):
++    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
++
++
++@triton.jit
++def _partial_max(X, VALUES, INDICES, V: tl.constexpr, S0: tl.constexpr,
++                 S1: tl.constexpr, PARTS: tl.constexpr, BLOCK: tl.constexpr):
++    row, part = tl.program_id(0), tl.program_id(1)
++    col = part * BLOCK + tl.arange(0, BLOCK)
++    values = tl.load(X + row * S0 + col * S1, col < V, other=-float("inf"))
++    # NaNs propagate to the unchanged caller-side finite-value assertion.
++    maximum = tl.reduce(values, 0, _maximum_with_nan)
++    matches = (values == maximum) | ((values != values) & (maximum != maximum))
++    index = tl.min(tl.where(matches & (col < V), col, 2147483647), 0)
++    tl.store(VALUES + row * PARTS + part, maximum)
++    tl.store(INDICES + row * PARTS + part, index)
++
++
++@triton.jit
++def _finish_max(VALUES, INDICES, MAXIMUM, INDEX, PARTS: tl.constexpr,
++                BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    part = tl.arange(0, BLOCK)
++    values = tl.load(VALUES + row * PARTS + part, part < PARTS, other=-float("inf"))
++    indices = tl.load(INDICES + row * PARTS + part, part < PARTS, other=2147483647)
++    maximum = tl.reduce(values, 0, _maximum_with_nan)
++    matches = (values == maximum) | ((values != values) & (maximum != maximum))
++    index = tl.min(tl.where(matches, indices, 2147483647), 0)
++    tl.store(MAXIMUM + row, maximum)
++    tl.store(INDEX + row, index)
++
++
++def parallel_max(logits):
++    """Match torch.max(dim=-1, keepdim=True), including lowest-index ties."""
++    assert logits.is_cuda and logits.dtype == torch.float32
++    count, vocab = logits.shape
++    assert vocab > 0
++    parts = triton.cdiv(vocab, 1024)
++    selected = logits.new_empty((count, 1))
++    indices = torch.empty((count, 1), dtype=torch.int64, device=logits.device)
++    if count:
++        partial = logits.new_empty((count, parts))
++        partial_indices = torch.empty((count, parts), dtype=torch.int32, device=logits.device)
++        _partial_max[(count, parts)](logits, partial, partial_indices, vocab,
++                                    logits.stride(0), logits.stride(1), parts, 1024,
++                                    num_warps=4, enable_fp_fusion=False)
++        _finish_max[(count,)](partial, partial_indices, selected, indices, parts,
++                             triton.next_power_of_2(parts), num_warps=4,
++                             enable_fp_fusion=False)
++    return selected, indices
+diff --git a/deepinfer/model_executor/layers/greedy_metadata.py b/deepinfer/model_executor/layers/greedy_metadata.py
+new file mode 100644
+index 0000000..40389f0
+--- /dev/null
++++ b/deepinfer/model_executor/layers/greedy_metadata.py
+@@ -0,0 +1,69 @@
++"""Fuse metadata for the existing exact greedy distribution on CUDA."""
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra.cuda import libdevice
++
++
++@triton.jit
++def _metadata(
++    argmax, logprobs, token_index, candidate, verify, draft_ids, draft_probs,
++    draft_index, remap, accepted, selected_draft, accept_probs,
++    count: tl.constexpr, output_stride: tl.constexpr, verify_stride: tl.constexpr,
++    ids_stride: tl.constexpr, probs_stride: tl.constexpr, index_stride: tl.constexpr,
++    remap_stride: tl.constexpr, rejection: tl.constexpr, has_remap: tl.constexpr,
++    penalty: tl.constexpr, BLOCK: tl.constexpr,
++):
++    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    active = i < count
++    token = tl.load(argmax + i, active, other=0).to(tl.int32)
++    tl.store(token_index + i, token, active)
++    tl.store(logprobs + i * output_stride, 0.0, active)
++    tl.store(candidate + i, 0, active)
++    if rejection:
++        row = tl.load(remap + i * remap_stride, active, other=0) if has_remap else i
++        proposal = tl.load(draft_ids + row * ids_stride, active, other=-1)
++        proposal_index = tl.load(draft_index + row * index_stride, active, other=0)
++        proposal_prob = tl.load(draft_probs + row * probs_stride, active, other=0.0)
++        is_verify = tl.load(verify + i * verify_stride, active, other=False)
++        valid = (proposal >= 0) & (proposal_index == proposal)
++        selected = tl.where(valid, proposal_prob, -float("inf"))
++        matches = (proposal >= 0) & (proposal == token)
++        # Keep invalid-proposal handling distinct from distribution overlap.
++        overlap = tl.minimum(libdevice.exp(proposal_prob - penalty), 1.0, propagate_nan=tl.PropagateNan.ALL)
++        probability = tl.where(is_verify, tl.where(proposal_index == token, overlap, 0.0), 1.0)
++        tl.store(accepted + i, ~is_verify | matches, active)
++        tl.store(selected_draft + i, selected, active)
++        tl.store(accept_probs + i, probability, active)
++
++
++def singleton_metadata(argmax, logits, *, logprobs_out=None, is_verify=None,
++                       draft_token_ids_pool=None, draft_logprobs=None,
++                       draft_logprobs_index=None, mtp_info_read_rows=None,
++                       draft_prob_penalty=0.0):
++    count = logits.shape[0]
++    token_index = torch.empty((count, 1), dtype=torch.int32, device=logits.device)
++    candidate = torch.empty(count, dtype=torch.int32, device=logits.device)
++    logprobs = logits.new_empty((count, 1)) if logprobs_out is None else logprobs_out
++    assert logprobs.shape == (count, 1) and logprobs.dtype == logits.dtype
++    rejection = draft_logprobs is not None
++    accepted = selected = rates = None
++    if rejection:
++        assert is_verify is not None and draft_token_ids_pool is not None
++        assert draft_logprobs.shape[1] == 1 and draft_logprobs_index is not None
++        assert draft_logprobs.dtype == torch.float32
++        accepted = torch.empty(count, dtype=torch.bool, device=logits.device)
++        selected = logits.new_empty(count)
++        rates = logits.new_empty(count)
++    if count:
++        def stride(t):
++            return t.stride(0) if t is not None else 0
++        _metadata[(triton.cdiv(count, 128),)](
++            argmax, logprobs, token_index, candidate, is_verify, draft_token_ids_pool,
++            draft_logprobs, draft_logprobs_index, mtp_info_read_rows, accepted, selected, rates,
++            count, logprobs.stride(0), stride(is_verify), stride(draft_token_ids_pool),
++            stride(draft_logprobs), stride(draft_logprobs_index), stride(mtp_info_read_rows),
++            rejection, mtp_info_read_rows is not None, draft_prob_penalty, 128,
++            num_warps=4, enable_fp_fusion=False,
++        )
++    return logprobs, token_index, candidate, accepted, selected, rates
+diff --git a/deepinfer/model_executor/layers/greedy_reduction.py b/deepinfer/model_executor/layers/greedy_reduction.py
+new file mode 100644
+index 0000000..9fc087c
+--- /dev/null
++++ b/deepinfer/model_executor/layers/greedy_reduction.py
+@@ -0,0 +1,85 @@
++"""Two kernels for exact small-batch greedy sampling over the full vocabulary."""
++import torch
++import triton
++import triton.language as tl
++from triton.language.extra.cuda import libdevice
++
++from .greedy_argmax import _maximum_with_nan, _partial_max
++
++
++@triton.jit
++def _finish(
++    values, indices, logprobs, token_index, candidate, verify, draft_ids,
++    draft_probs, draft_index, remap, accepted, selected_draft, accept_probs,
++    PARTS: tl.constexpr, BLOCK: tl.constexpr, output_stride: tl.constexpr,
++    verify_stride: tl.constexpr, ids_stride: tl.constexpr, probs_stride: tl.constexpr,
++    index_stride: tl.constexpr, remap_stride: tl.constexpr,
++    rejection: tl.constexpr, has_remap: tl.constexpr, penalty: tl.constexpr,
++):
++    row = tl.program_id(0)
++    part = tl.arange(0, BLOCK)
++    partial = tl.load(values + row * PARTS + part, part < PARTS, other=-float("inf"))
++    index = tl.load(indices + row * PARTS + part, part < PARTS, other=2147483647)
++    maximum = tl.reduce(partial, 0, _maximum_with_nan)
++    # Always compiled with debug=True: this is a required asynchronous input
++    # check, not an optional diagnostic. Invalid inputs abort the CUDA context.
++    tl.device_assert((maximum == maximum) & (maximum != float("inf")) & (maximum != -float("inf")),
++                     "Invalid logits: NaN, +inf, or all -inf")
++    token = tl.min(tl.where(partial == maximum, index, 2147483647), 0)
++    tl.store(token_index + row, token)
++    tl.store(logprobs + row * output_stride, 0.0)
++    tl.store(candidate + row, 0)
++    if rejection:
++        pool_row = tl.load(remap + row * remap_stride) if has_remap else row
++        proposal = tl.load(draft_ids + pool_row * ids_stride)
++        proposal_index = tl.load(draft_index + pool_row * index_stride)
++        proposal_prob = tl.load(draft_probs + pool_row * probs_stride)
++        is_verify = tl.load(verify + row * verify_stride)
++        valid = (proposal >= 0) & (proposal_index == proposal)
++        matches = (proposal >= 0) & (proposal == token)
++        overlap = tl.minimum(libdevice.exp(proposal_prob - penalty), 1.0, propagate_nan=tl.PropagateNan.ALL)
++        probability = tl.where(is_verify, tl.where(proposal_index == token, overlap, 0.0), 1.0)
++        tl.store(accepted + row, ~is_verify | matches)
++        tl.store(selected_draft + row, tl.where(valid, proposal_prob, -float("inf")))
++        tl.store(accept_probs + row, probability)
++
++
++def fused_singleton_sample(logits, *, logprobs_out=None, is_verify=None,
++                           draft_token_ids_pool=None, draft_logprobs=None,
++                           draft_logprobs_index=None, mtp_info_read_rows=None,
++                           draft_prob_penalty=0.0):
++    count, vocab = logits.shape
++    assert logits.is_cuda and logits.dtype == torch.float32 and 0 < count <= 32 and vocab > 0
++    parts = triton.cdiv(vocab, 1024)
++    partial = logits.new_empty((count, parts))
++    partial_index = torch.empty((count, parts), dtype=torch.int32, device=logits.device)
++    token_index = torch.empty((count, 1), dtype=torch.int32, device=logits.device)
++    candidate = torch.empty(count, dtype=torch.int32, device=logits.device)
++    logprobs = logits.new_empty((count, 1)) if logprobs_out is None else logprobs_out
++    assert logprobs.shape == (count, 1) and logprobs.dtype == logits.dtype
++    rejection = draft_logprobs is not None
++    accepted = selected = rates = None
++    if rejection:
++        assert is_verify is not None and draft_token_ids_pool is not None
++        assert draft_logprobs.shape[1] == 1 and draft_logprobs_index is not None
++        assert draft_logprobs.dtype == torch.float32
++        accepted = torch.empty(count, dtype=torch.bool, device=logits.device)
++        selected = logits.new_empty(count)
++        rates = logits.new_empty(count)
++    _partial_max[(count, parts)](logits, partial, partial_index, vocab,
++                                logits.stride(0), logits.stride(1), parts, 1024,
++                                num_warps=4, enable_fp_fusion=False)
++
++    def stride(t):
++        return t.stride(0) if t is not None else 0
++
++    _finish[(count,)](
++        partial, partial_index, logprobs, token_index, candidate, is_verify,
++        draft_token_ids_pool, draft_logprobs, draft_logprobs_index, mtp_info_read_rows,
++        accepted, selected, rates, parts, triton.next_power_of_2(parts), logprobs.stride(0),
++        stride(is_verify), stride(draft_token_ids_pool), stride(draft_logprobs),
++        stride(draft_logprobs_index), stride(mtp_info_read_rows), rejection,
++        mtp_info_read_rows is not None, draft_prob_penalty,
++        num_warps=4, enable_fp_fusion=False, debug=True,
++    )
++    return logprobs, token_index, candidate, accepted, selected, rates
+diff --git a/deepinfer/model_executor/layers/greedy_sampler.py b/deepinfer/model_executor/layers/greedy_sampler.py
+new file mode 100644
+index 0000000..1dd4b6e
+--- /dev/null
++++ b/deepinfer/model_executor/layers/greedy_sampler.py
+@@ -0,0 +1,71 @@
++"""Exact singleton sampling prototype for native force_topk=1 integration."""
++import torch
++
++from deepinfer import envs
++
++
++def singleton_sample(logits, *, logprobs_out=None, is_verify=None,
++                     draft_token_ids_pool=None, draft_logprobs=None,
++                     draft_logprobs_index=None, mtp_info_read_rows=None,
++                     draft_prob_penalty=0.0):
++    """Return the process_sampling tuple in a one-token candidate space.
++
++    Argmax uses the lowest vocabulary index for ties. This represents the full
++    greedy distribution exactly, without truncating an uncertain candidate set.
++    Draft pools must use the same singleton representation.
++    """
++    assert logits.ndim == 2 and logits.shape[1] > 0
++    count = logits.shape[0]
++    if (logits.is_cuda and logits.dtype == torch.float32 and 0 < count <= 32
++            and envs.DEEPINFER_FUSE_GREEDY_REDUCTION):
++        from .greedy_reduction import fused_singleton_sample
++
++        return fused_singleton_sample(
++            logits, logprobs_out=logprobs_out, is_verify=is_verify,
++            draft_token_ids_pool=draft_token_ids_pool, draft_logprobs=draft_logprobs,
++            draft_logprobs_index=draft_logprobs_index, mtp_info_read_rows=mtp_info_read_rows,
++            draft_prob_penalty=draft_prob_penalty,
++        )
++    if (logits.is_cuda and logits.dtype == torch.float32 and 0 < count <= 32
++            and envs.DEEPINFER_PARALLEL_GREEDY_MAX
++            and torch.cuda.is_current_stream_capturing()):
++        from .greedy_argmax import parallel_max
++
++        selected, token_index = parallel_max(logits)
++    else:
++        selected, token_index = logits.max(-1, keepdim=True)
++    torch._assert_async(torch.isfinite(selected).all(), "Invalid logits: NaN, +inf, or all -inf")
++    if logits.is_cuda and logits.dtype == torch.float32 and envs.DEEPINFER_FUSE_SINGLETON_METADATA:
++        from .greedy_metadata import singleton_metadata
++
++        return singleton_metadata(
++            token_index, logits, logprobs_out=logprobs_out, is_verify=is_verify,
++            draft_token_ids_pool=draft_token_ids_pool, draft_logprobs=draft_logprobs,
++            draft_logprobs_index=draft_logprobs_index, mtp_info_read_rows=mtp_info_read_rows,
++            draft_prob_penalty=draft_prob_penalty,
++        )
++    token_index = token_index.to(torch.int32)
++    if logprobs_out is None:
++        logprobs = logits.new_zeros((count, 1))
++    else:
++        assert logprobs_out.shape == (count, 1)
++        logprobs = logprobs_out.zero_()
++    candidate = torch.zeros(count, dtype=torch.int32, device=logits.device)
++    if draft_logprobs is None:
++        return logprobs, token_index, candidate, None, None, None
++
++    assert is_verify is not None and draft_token_ids_pool is not None
++    assert draft_logprobs.shape[1] == 1 and draft_logprobs_index is not None
++    rows = (torch.arange(count, device=logits.device) if mtp_info_read_rows is None
++            else mtp_info_read_rows.long())
++    draft_ids = draft_token_ids_pool[rows]
++    valid = (draft_ids >= 0) & (draft_logprobs_index[rows, 0] == draft_ids)
++    selected_draft = torch.where(valid, draft_logprobs[rows, 0], -torch.inf)
++    matches = (draft_ids >= 0) & (draft_ids == token_index[:, 0])
++    accepted = ~is_verify | matches
++    # Match the native residual-mass statistic; actual greedy verification
++    # accepts a matching token and rejects a different token deterministically.
++    distribution_matches = draft_logprobs_index[rows, 0] == token_index[:, 0]
++    overlap = (draft_logprobs[rows, 0] - draft_prob_penalty).exp().clamp(max=1)
++    accept_probs = torch.where(is_verify, torch.where(distribution_matches, overlap, 0.), 1.)
++    return logprobs, token_index, candidate, accepted, selected_draft, accept_probs
+diff --git a/deepinfer/model_executor/layers/sampler.py b/deepinfer/model_executor/layers/sampler.py
+index 384a588..0b1284e 100644
+--- a/deepinfer/model_executor/layers/sampler.py
++++ b/deepinfer/model_executor/layers/sampler.py
+@@ -640,6 +640,18 @@ class Sampler(nn.Module):
+         token_index: torch.Tensor | None,
+     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+         if max_top_logprobs > 0:
++            if self.force_topk == 1:
++                assert 1 <= max_top_logprobs <= self.vocab_size
++                if max_top_logprobs == 1:
++                    return logprobs, token_index
++                # The remaining vocabulary has zero mass. Return distinct IDs
++                # in vocabulary order without sending a one-column matrix to
++                # deep_select, whose row stride must be aligned to 1024 bytes.
++                top_logprobs = logprobs.new_full((logprobs.shape[0], max_top_logprobs), -torch.inf)
++                top_logprobs[:, :1] = logprobs
++                other_ids = torch.arange(max_top_logprobs - 1, dtype=torch.int32, device=logprobs.device)[None, :]
++                other_ids = other_ids + (other_ids >= token_index).to(torch.int32)
++                return top_logprobs, torch.cat((token_index, other_ids), dim=1)
+             top_logprobs, top_token_ids = topk(logprobs, max_top_logprobs, True, indices_type=torch.int32)
+             if self.force_topk:
+                 top_token_ids = token_index.gather(-1, top_token_ids)
+diff --git a/deepinfer/model_executor/layers/sampler_utils.py b/deepinfer/model_executor/layers/sampler_utils.py
+index 8b5a8ed..9694c16 100644
+--- a/deepinfer/model_executor/layers/sampler_utils.py
++++ b/deepinfer/model_executor/layers/sampler_utils.py
+@@ -4,6 +4,8 @@ import torch
+ from deep_select.interface import topk
+ 
+ from deepinfer.model_executor.layers.linear import bf16_gemm_nt
++from deepinfer.model_executor.layers.greedy_sampler import singleton_sample
++from deepinfer.model_executor.layers.tilelang_ops.common import DRAFT_PROB_PENALTY
+ from deepinfer.model_executor.layers.tilelang_ops.fused_sample import fused_sample
+ from deepinfer.model_executor.layers.tilelang_ops.sampler import expand_sampling_params, map_lookup, remap_draft_topk
+ from deepinfer.model_executor.parallel_utils.parallel_state import PG
+@@ -64,12 +66,15 @@ def _compute_prompt_logprobs_chunk(
+         return None
+ 
+     token_indices = None
+-    if force_topk:
+-        logits, token_indices = topk(logits, force_topk, False, indices_type=torch.int32)
+-    logprobs, _, _, _, _ = fused_sample(
+-        logits,
+-        LogitsTransformInputs(inputs.logits.temperatures[start:end], inputs.logits.top_ps[start:end], inputs.logits.top_ks[start:end]),
+-    )
++    if force_topk == 1:
++        logprobs, token_indices, _, _, _, _ = singleton_sample(logits)
++    else:
++        if force_topk:
++            logits, token_indices = topk(logits, force_topk, False, indices_type=torch.int32)
++        logprobs, _, _, _, _ = fused_sample(
++            logits,
++            LogitsTransformInputs(inputs.logits.temperatures[start:end], inputs.logits.top_ps[start:end], inputs.logits.top_ks[start:end]),
++        )
+     return map_lookup(
+         token_indices,
+         logprobs,
+@@ -159,6 +164,15 @@ def process_sampling(
+         The last three outputs are None when rejection is disabled.
+     """
+ 
++    if force_topk == 1:
++        return singleton_sample(
++            logits, logprobs_out=logprobs_out, is_verify=is_verify,
++            draft_token_ids_pool=draft_token_ids_pool,
++            draft_logprobs=last_nextn_token_logprobs,
++            draft_logprobs_index=last_nextn_token_logprobs_index,
++            mtp_info_read_rows=mtp_info_read_rows,
++            draft_prob_penalty=DRAFT_PROB_PENALTY,
++        )
+     if row_to_req is not None:
+         sampling_inputs = expand_sampling_params(sampling_inputs, row_to_req, local_step)
+ 
+diff --git a/deepinfer/timer.py b/deepinfer/timer.py
+index d9f4909..3227735 100644
+--- a/deepinfer/timer.py
++++ b/deepinfer/timer.py
+@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+-from deepinfer import PLATFORM
++from deepinfer import PLATFORM, envs
+ 
+ if TYPE_CHECKING:
+     from deepinfer._C.graph_timer import EventHandle, EventRecordNodeHandle, GraphHandle
+@@ -53,7 +53,7 @@ class CPUTimer(BaseTimer):
+         enable: bool = True,
+         record_name: str | None = None,
+     ) -> Generator[None, None, None]:
+-        if not enable:
++        if not enable or envs.DEEPINFER_DISABLE_RUNTIME_TIMERS:
+             yield
+             return
+         t0 = time.perf_counter()
+@@ -95,7 +95,7 @@ class CUDAGraphTimer(BaseTimer):
+     @functools.cache
+     def supported() -> bool:
+         """Whether the platform backend supports graph probes."""
+-        return PLATFORM.is_gpu
++        return PLATFORM.is_gpu and not envs.DEEPINFER_DISABLE_RUNTIME_TIMERS
+ 
+     @contextmanager
+     def record(
+@@ -236,7 +236,8 @@ class CUDATimer(BaseTimer):
+         enabled: bool = True,
+         scale: float | None = None,
+     ) -> Generator[None, None, None]:
+-        if not enabled:
++        needed_for_varlen = envs.DEEPINFER_ENABLE_MTP_VARLEN and name in ("device_forward", "device_sample")
++        if not enabled or (envs.DEEPINFER_DISABLE_RUNTIME_TIMERS and not needed_for_varlen):
+             yield
+             return
+ 

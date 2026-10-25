@@ -26,10 +26,22 @@ if [[ -n "${VENV_PATH:-}" ]]; then
   source "$VENV_PATH/bin/activate"
 fi
 
-for patch in "$PATCH_DIR"/*.patch; do
-  echo "applying $(basename "$patch")"
+patch="$PATCH_DIR/deepep-engram-lsa-fetch.patch"
+expected=f6aa38fe06cd4a0489e7730365d4e0114970a2f3
+if [[ "$(git -C "$DEEP_EP" rev-parse HEAD)" != "$expected" ]]; then
+  echo "Expected DeepEP $expected; initialize the pinned DeepInfer submodule." >&2
+  exit 1
+fi
+if git -C "$DEEP_EP" apply --reverse --check "$patch" 2>/dev/null; then
+  echo "DeepEP patch already applied."
+else
+  git -C "$DEEP_EP" apply --check "$patch"
   git -C "$DEEP_EP" apply "$patch"
-done
+fi
+# Allows patching before DeepInfer build.sh builds all vendor wheels.
+if [[ "${APPLY_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
 
 mkdir -p "$WHEEL_DIR"
 cd "$DEEP_EP"

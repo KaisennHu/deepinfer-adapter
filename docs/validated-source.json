@@ -1,0 +1,60 @@
+{
+  "source_date": "2026-10-25",
+  "adapter_base_commit": "5730cee17b80038471e5ec8503584c22cba592da",
+  "deepinfer_base_commit": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+  "router_commit": "305c1d2f0fc0d3cc9bf59e8d802d27682249e68d",
+  "adapter_python_sha256": {
+    "deepinfer_adapter/__init__.py": "f9e130dd7a6b28178e74eae1b64a715c12020ea511366759031b8bf5bb6379c9",
+    "deepinfer_adapter/backends.py": "dc80281c5d8edccd527f9da8ecc6ccff0955c903ad800ae2e6204b82ffe3896e",
+    "deepinfer_adapter/cuda_ipc_pool.py": "f2a6447f3722fa31a3d4c8f7e1994ed7a6578292c4a2928de3f9daa102949e8d",
+    "deepinfer_adapter/pd_http.py": "b1e940e81be6bd1685dfba8ad7d2e30cb95ca81867bcff6419d27ceb436e8653",
+    "deepinfer_adapter/prefix_snapshot.py": "5cf87e6f4745bea6e94869050d1d731d7e52b360e20e5a051b4d2226dd4a66ae",
+    "deepinfer_adapter/proto_gen/control_pb2.py": "367387fd2edf3289a2f34ca8fe712a388243dc3525d1dddc9bb1452f9de20728",
+    "deepinfer_adapter/proto_gen/control_pb2_grpc.py": "81c1f024d2157f62441641931f80fcb42ac45c0a0340f648de270aee8c50f1b7",
+    "deepinfer_adapter/proto_gen/inference_pb2.py": "2484bdb39ff3380ac04a3f5b35bb863de48e38819d67f3d56a9e3d0868c80a62",
+    "deepinfer_adapter/proto_gen/inference_pb2_grpc.py": "f4ea85391bccc8acf43e7c073568b85cf8710b3e591c6a09447b9cc15eee798a",
+    "deepinfer_adapter/server.py": "2dc662c8f8f95cc6fdcf69cba04b7c12a4ef794b264e8b27a61a9782eff483e8",
+    "deepinfer_adapter/startup_gc.py": "24e1ae85a49af23f2b43d6eb488184f79221537107448f8f59fa47c0a72cc2c4",
+    "deepinfer_adapter/text_stream.py": "919c75312e2a63311ce3e3adaa6c74b6fcf2e87147593139aca924bb515f4ed1",
+    "scripts/numa_shim/sitecustomize.py": "d8064dfd93418920a5ae77e7ba25bec730c44f8e19e6b7728abd122f98f1b49e",
+    "tests/test_cold_routing.py": "7aa3f4ae9a0730177335e40e751adbf8331dec0891a18d436e0cf3e1b84404b3",
+    "tests/test_conformance.py": "9b3882eac7758be6018d36536a1e2c2a204684e838c832ccac46b2aad4867e0d",
+    "tests/test_cuda_ipc_pool.py": "3bd2ad3d48ce1c47a8f40de8badb0b2340331a392f361c26d62d5b7bd0672d63",
+    "tests/test_engram_lsa_addressing.py": "917612c842dcc709832e510cb091508df84577f77088fdf4f86f567d9a448f8e",
+    "tests/test_pd_readiness.py": "dd8a9533525dca216a6660a300a8e12e68aa75c1abcfba0219b351f26dc95577",
+    "tests/test_pd_sampling.py": "632d8317f1c109519bdd32ecb949a0d83818a616acaceb5f5c55f0ff6172a9ff",
+    "tests/test_prefix_routing.py": "c84bf66198ee337c2eca864097f95b94be0876194182136a631e64df7c287a43",
+    "tests/test_prefix_snapshot.py": "bcf2c6e624b5cd9cc23e8c2596cf413808d960b0f8559e2a9fefc7bda47c96ca",
+    "tests/test_startup_gc.py": "0f32031f18ee869e5680b7b8b5bd0721a4546393c67a610482a08ef443251b5b",
+    "tests/test_text_stream.py": "48b7f659a49d02b6de38bda87fb770a72a88258e6cae350eba04deaaf401035c",
+    "tests/test_yoco_prefix.py": "ec2ae994bbedaedd56f30d861d0604b288382b9437de5764d028637210383914"
+  },
+  "deepinfer_native_libraries_sha256": {
+    "deepinfer/_so/nvidia-x86_64/_C.cpython-312-x86_64-linux-gnu.so": "c37958972833dfc637db26c15a3d733745cc29af010daf4a0f41011c47ea46c2"
+  },
+  "deepinfer_patch_sha256": "a6628fa760af91d5b7667dca3bd4b0fd2775c00c2f7b467e93cf1ba423c9ad79",
+  "deepinfer_patched_files_sha256": {
+    "csrc/engine/block_manager.hpp": "439bd088ab27677dbdca3ae3d1fe1ccb9b3413ba3da3cd47f6c17d3ebb054432",
+    "csrc/engine/pybind_scheduler.cpp": "6db358df31f747d33696f80916854b4878ccd77bbb44662a2199af9fbff19b31",
+    "csrc/engine/pybind_sequence.cpp": "732588422026ff8edbeb90c17e3bea58ae7768152bffa91e4237554a84bb5927",
+    "csrc/engine/scheduler.hpp": "39c7581d1c49ac40caea3b819860b721a81722e32ced04022c5c173ed0e499a9",
+    "deep_cluster/topology/bind.py": "04c9411d944e8a1b64e64f96ff491895fedac82e3568dc2024873d6cc4f142e5",
+    "deepinfer/engine/llm_engine.py": "829dc06b092f6069ff7413fcb5049605f260ff4323745f75e0075997f059f0ac",
+    "deepinfer/environ.py": "7426e4a6caebb14c80ff35a52045c687fdb423bbd5bdc24faf36f941a4d9dc24",
+    "deepinfer/model_executor/layers/greedy_argmax.py": "5967b9084bee24d764573c9a74720a90b6573266c1c45eeba040298c2bd6ad32",
+    "deepinfer/model_executor/layers/greedy_metadata.py": "75e7a60da49edbb0cb261b4c3710625f045c42ad8eb39d0a915e4510f5502b38",
+    "deepinfer/model_executor/layers/greedy_reduction.py": "bfc98e9d3a18eb673568fe5477f105934024ddee21eaf91d8fa376de65762c0b",
+    "deepinfer/model_executor/layers/greedy_sampler.py": "6097b9f95445e033c9688ec6c1c659bc97c6d431f17379635b27787542b01d28",
+    "deepinfer/model_executor/layers/sampler.py": "f32deb48ef2789a6c5dce4f3941753bede54d70b543c5c5f338ea3b7f0986286",
+    "deepinfer/model_executor/layers/sampler_utils.py": "9ac4c01ff53d517cad05becd95b70affc89fe3134bdff60b671b7e6069537e84",
+    "deepinfer/timer.py": "8dd4bb260b4d174198a801ff8aa6edff47f8464dacf9b0c2758f7e56e3007400"
+  },
+  "packaging_notes": [
+    "C++ pybind_sequence.cpp CRLF normalized to LF; source logic unchanged.",
+    "Generated gRPC bindings are regenerated from the committed proto schema.",
+    "Package version changed from 0.1.0 to 0.2.0; core serving files are unchanged.",
+    "New launch scripts and explicit b300-1p1d profile reproduce the validated serving arguments."
+  ],
+  "deep_ep_base_commit": "f6aa38fe06cd4a0489e7730365d4e0114970a2f3",
+  "deep_ep_patch_sha256": "0be661a0ad16584dbdedfd4b36cd4ca19689ad82680eadf7d3e2eea5fa5001ae"
+}
